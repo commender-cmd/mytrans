@@ -81,6 +81,36 @@ class RawMediaPipeParsingTests(unittest.TestCase):
             with self.subTest(labels=labels), self.assertRaisesRegex(ValueError, "handedness"):
                 parse_result(result(labels), 1)
 
+    def test_realtime_opt_in_drops_only_invalid_known_side_with_explicit_reason(self):
+        for bad_side, labels in (("left", ("Left", "Right")), ("right", ("Right", "Left"))):
+            for invalid in (hand()[:20], [NS(x=np.nan, y=0.1, z=0.2)] * 21):
+                with self.subTest(side=bad_side):
+                    detected = result(labels, [invalid, hand()])
+                    frame = parse_result(detected, 1, invalid_hand_as_missing=True)
+                    self.assertIsNone(frame[bad_side])
+                    other = "right" if bad_side == "left" else "left"
+                    self.assertEqual(frame[other].shape, (21, 3))
+                    self.assertTrue(np.isfinite(frame[other]).all())
+                    self.assertIn(bad_side, frame["metadata"]["invalid_reasons"])
+                    with self.assertRaises(ValueError):
+                        parse_result(detected, 1)
+
+    def test_realtime_opt_in_does_not_guess_unknown_handedness(self):
+        with self.assertRaisesRegex(ValueError, "handedness"):
+            parse_result(result(["Unknown"]), 1, invalid_hand_as_missing=True)
+
+    def test_realtime_duplicate_known_labels_invalidate_side_without_overwriting(self):
+        for label in ("Left", "Right"):
+            with self.subTest(label=label):
+                frame = parse_result(result([label, label]), 1, invalid_hand_as_missing=True)
+                self.assertIsNone(frame["left"])
+                self.assertIsNone(frame["right"])
+                self.assertIn("Duplicate handedness", frame["metadata"]["invalid_reasons"][label.lower()])
+                # Even if the first duplicate was malformed, do not take the second.
+                frame = parse_result(result([label, label], [hand()[:20], hand()]), 1,
+                                     invalid_hand_as_missing=True)
+                self.assertIsNone(frame[label.lower()])
+
     def test_malformed_results_raise_instead_of_returning_partial_data(self):
         missing_xyz = hand()
         missing_xyz[3] = NS(x=0.2, y=0.1)
@@ -177,6 +207,19 @@ class MediaPipeCameraLifecycleTests(unittest.TestCase):
         output = self.camera().next_frame()
         self.assertEqual(output["left"].shape, (21, 3))
         np.testing.assert_array_equal(output["left"][0], np.array([0.1, 0.2, -0.03], dtype=np.float32))
+
+    def test_realtime_invalid_hand_policy_keeps_camera_running_and_other_hand_valid(self):
+        invalid = hand()
+        invalid[3].x = np.nan
+        self.landmarker.detect_for_video.side_effect = [result(["Left", "Right"], [invalid, hand()]), result(["Left", "Right"])]
+        with MediaPipeCameraInput(self.asset, invalid_hand_as_missing=True) as camera:
+            first = camera.next_frame()
+            self.assertIsNone(first["left"])
+            self.assertEqual(first["right"].shape, (21, 3))
+            self.cap.release.assert_not_called()
+            second = camera.next_frame()
+            self.assertEqual(second["left"].shape, (21, 3))
+            self.assertEqual(second["right"].shape, (21, 3))
 
     def test_repeated_or_backward_clock_keeps_video_timestamps_increasing(self):
         camera = self.camera()

@@ -28,14 +28,23 @@ MIN_DET_CONF = 0.5
 MIN_TRK_CONF = 0.5
 
 
-def parse_result(result, timestamp_ms: int, metadata: dict | None = None) -> dict:
+def parse_result(
+    result, timestamp_ms: int, metadata: dict | None = None,
+    *, invalid_hand_as_missing: bool = False,
+) -> dict:
     """Extract a single detection result; malformed detections raise ValueError.
 
 ``timestamp`` is the exact Unix millisecond integer passed to VIDEO detection.
 Missing hands are None. Present hands retain the original normalized x/y/z
 values and landmark order, with shape (21, 3) and dtype float32.
+An opt-in realtime policy drops malformed landmarks for a known side, records
+the error in metadata, and preserves the other side. Repeated known labels
+invalidate that side instead of choosing one detection. Unknown labels still
+raise; the default remains strict.
 """
     hands = {"left": None, "right": None}
+    seen_sides = set()
+    invalid_reasons = {}
     try:
         landmarks = result.hand_landmarks
         handedness = result.handedness
@@ -47,17 +56,28 @@ values and landmark order, with shape (21, 3) and dtype float32.
             if label not in ("Left", "Right"):
                 raise ValueError(f"Unknown handedness: {label!r}")
             side = label.lower()
-            if hands[side] is not None:
-                raise ValueError(f"Duplicate handedness: {label}; refusing to overwrite a hand")
-            with np.errstate(over="ignore", invalid="ignore"):
-                points = np.array(
-                    [[lm.x, lm.y, lm.z] for lm in hand_landmarks], dtype=np.float32
-                )
-            if points.shape != (21, 3):
-                raise ValueError(f"{side} landmarks must have shape (21, 3), got {points.shape}")
-            if not np.isfinite(points).all():
-                raise ValueError(f"{side} landmarks must be finite float32 values")
-            hands[side] = points
+            if side in seen_sides:
+                message = f"Duplicate handedness: {label}; refusing to overwrite a hand"
+                if not invalid_hand_as_missing:
+                    raise ValueError(message)
+                hands[side] = None
+                invalid_reasons[side] = message
+                continue
+            seen_sides.add(side)
+            try:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    points = np.array(
+                        [[lm.x, lm.y, lm.z] for lm in hand_landmarks], dtype=np.float32
+                    )
+                if points.shape != (21, 3):
+                    raise ValueError(f"{side} landmarks must have shape (21, 3), got {points.shape}")
+                if not np.isfinite(points).all():
+                    raise ValueError(f"{side} landmarks must be finite float32 values")
+                hands[side] = points
+            except (AttributeError, TypeError, ValueError, OverflowError) as error:
+                if not invalid_hand_as_missing:
+                    raise
+                invalid_reasons[side] = str(error)
     except (AttributeError, IndexError, TypeError, OverflowError) as error:
         raise ValueError("Malformed MediaPipe landmarks or handedness") from error
     return {
@@ -67,6 +87,7 @@ values and landmark order, with shape (21, 3) and dtype float32.
             **({} if metadata is None else metadata),
             "source_landmark_space": "mediapipe_normalized",
             "timestamp_unit": "unix_ms",
+            **({"invalid_reasons": invalid_reasons} if invalid_reasons else {}),
         },
     }
 
@@ -81,6 +102,8 @@ class MediaPipeCameraInput:
         width: int = IMAGE_WIDTH,
         height: int = IMAGE_HEIGHT,
         fps: int = CAM_FPS,
+        *,
+        invalid_hand_as_missing: bool = False,
     ):
         model_path = Path(model_asset_path)
         if not model_path.is_file():
@@ -96,6 +119,7 @@ class MediaPipeCameraInput:
         self._camera_index = camera_index
         self._frame_index = 0
         self._last_timestamp_ms = None
+        self._invalid_hand_as_missing = invalid_hand_as_missing
         options = mp.tasks.vision.HandLandmarkerOptions(
             base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
             running_mode=mp.tasks.vision.RunningMode.VIDEO,
@@ -140,7 +164,7 @@ backward, to satisfy the landmarker's increasing-timestamp requirement.
                 "frame_index": self._frame_index,
                 "image_width": int(frame.shape[1]),
                 "image_height": int(frame.shape[0]),
-            })
+            }, invalid_hand_as_missing=self._invalid_hand_as_missing)
             self._last_timestamp_ms = timestamp_ms
             self._frame_index += 1
             return output

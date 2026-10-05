@@ -1,31 +1,117 @@
-"""
-MediaPipe 摄像头适配器，用于低成本手部跟踪实验。
+"""MediaPipe raw input -> per-frame palm-local alignment -> three-frame windows.
 
-该模块使用 MediaPipe 的手部关键点检测模型，从摄像头读取视频流，
-逐帧检测左右手的关键点，并交给共享 Hand Core 处理 canonicalization、
-三帧窗口和标准输入载荷（payload）。
+Identity tracking is disabled: MediaPipe handedness is used directly. Each
+invalid side resets immediately and independently; no historical frame or basis
+is reused. The demo loads palm_local_v2 and prints 18D outputs without sending
+commands or recording data.
 """
 
 from __future__ import annotations
 
-import time
+import argparse
 from pathlib import Path
+import time
 
 import numpy as np
 
-# 导入手部关键点缓冲区以及数据来源常量（MEDIAPIPE_APPROX_SOURCE）
-from retargeting.hand_core import CanonicalHandProcessor
+from retargeting.coordinates import (
+    PALM_LOCAL_COORDINATE_ALIGNMENT,
+    PALM_LOCAL_METADATA,
+    align_palm_local_coordinates,
+    build_l21_reference_basis,
+)
+from retargeting.inputs.mediapipe import MediaPipeCameraInput
 from retargeting.tracking import (
     DEFAULT_MAX_CENTER_DISPLACEMENT,
     DEFAULT_MAX_SHAPE_RMSE,
     MEDIAPIPE_APPROX_SOURCE,
+    HandWindowBuffer,
+    ensure_hand25,
 )
 
 
+PALM_LOCAL_V2_CHECKPOINT = (
+    Path(__file__).resolve().parents[1]
+    / "checkpoint/models/twohand_h5/linker/palm_local_v2/model_best.pth"
+)
+SIDES = ("left", "right")
+
+
+class MediaPipePalmLocalProcessor:
+    """Camera-independent processing of the raw input's single-frame mapping."""
+
+    def __init__(self):
+        # Fatal robot-reference errors propagate before any camera is opened.
+        # Each zero-pose robot basis is computed exactly once for this stream.
+        self._robot_bases = {side: build_l21_reference_basis(side) for side in SIDES}
+        self._buffer = HandWindowBuffer(receptive_field=3)
+        self.current_hands = {side: None for side in SIDES}
+        self.valid_streak = {side: 0 for side in SIDES}
+        self.invalid_reasons = {side: None for side in SIDES}
+
+    def process_frame(self, frame: dict) -> dict | None:
+        """Align each raw21 hand before appending to its own buffer.
+
+        current_hands exposes this frame's aligned (25,3) values for smoke and
+        equivalence checks. It never holds an old frame on invalid input.
+        """
+        current = {side: None for side in SIDES}
+        for side in SIDES:
+            raw = frame[side]
+            reason = frame.get("metadata", {}).get("invalid_reasons", {}).get(side, "missing") if raw is None else None
+            if raw is not None:
+                try:
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        points = np.asarray(raw, dtype=np.float32)
+                        if points.shape != (21, 3):
+                            raise ValueError(f"raw shape must be (21,3), got {points.shape}")
+                        if not np.isfinite(points).all():
+                            raise ValueError("nonfinite raw landmarks")
+                        points25 = ensure_hand25(points)
+                        aligned = align_palm_local_coordinates(points25, self._robot_bases[side])
+                    if aligned.shape != (25, 3) or not np.isfinite(aligned).all() or not np.any(aligned):
+                        reason = "invalid or degenerate palm-local frame"
+                    else:
+                        current[side] = aligned
+                except (TypeError, ValueError, OverflowError) as error:
+                    reason = str(error)
+            if current[side] is None:
+                # update_canonical(None) alone does not clear old history.
+                self._buffer.reset_side(side)
+                self.valid_streak[side] = 0
+            else:
+                self.valid_streak[side] = min(self.valid_streak[side] + 1, 3)
+            self.invalid_reasons[side] = reason
+
+        self.current_hands = current
+        metadata = {
+            **frame.get("metadata", {}),
+            **PALM_LOCAL_METADATA,
+            "identity_tracking": False,
+            "hand_valid": {side: current[side] is not None for side in SIDES},
+            "invalid_reasons": dict(self.invalid_reasons),
+        }
+        # Already aligned: never use update(), which reconverts coordinates.
+        return self._buffer.update_canonical(
+            left_hand=current["left"], right_hand=current["right"],
+            timestamp=frame.get("timestamp"), source=MEDIAPIPE_APPROX_SOURCE,
+            metadata=metadata,
+        )
+
+    def reset(self) -> None:
+        self._buffer.reset()
+        self.current_hands = {side: None for side in SIDES}
+        self.valid_streak = {side: 0 for side in SIDES}
+        self.invalid_reasons = {side: None for side in SIDES}
+
+
 class MediaPipeCameraAdapter:
-    """
-    从网络摄像头读取数据，使用 MediaPipe 提取手部关键点，
-    并输出规范化的重定向输入载荷（供后续模型使用）。
+    """Compose raw camera capture with palm-local realtime processing.
+
+    next_input() retains the optional-window payload and relative seconds
+    timestamp. Capture errors propagate after clearing history.
+    The old identity thresholds are accepted for caller compatibility and have
+    no effect. Scale and confidence must retain the raw-input defaults.
     """
 
     def __init__(
@@ -40,125 +126,138 @@ class MediaPipeCameraAdapter:
         max_center_displacement: float = DEFAULT_MAX_CENTER_DISPLACEMENT,
         max_shape_rmse: float = DEFAULT_MAX_SHAPE_RMSE,
     ):
-        """
-        初始化摄像头适配器。
-
-        参数:
-            model_asset_path: MediaPipe 手部关键点模型文件路径（.task）
-            camera_index: 摄像头设备索引（默认 0）
-            width: 期望的视频帧宽度
-            height: 期望的视频帧高度
-            fps: 期望的帧率
-            scale_factor: 手部关键点的缩放系数（用于归一化）
-            min_confidence: 检测和跟踪的最小置信度阈值
-        """
-        # 验证模型文件是否存在
+        if scale_factor != 1.0:
+            raise ValueError("MediaPipe palm-local realtime requires scale_factor=1.0")
+        if min_confidence != 0.5:
+            raise ValueError("MediaPipeCameraInput uses fixed min_confidence=0.5")
         self.model_asset_path = Path(model_asset_path)
-        if not self.model_asset_path.exists():
-            raise FileNotFoundError(
-                f"MediaPipe hand model not found: {self.model_asset_path}"
-            )
-
-        # 延迟导入 OpenCV 和 MediaPipe，避免不必要的依赖加载
-        import cv2
-        import mediapipe as mp
-
-        self._cv2 = cv2
-        self._mp = mp
-
-        # 初始化手部数据缓冲区（用于累积多帧，构建时序窗口）
-        self._hand_core = CanonicalHandProcessor(
-            scale_factor=scale_factor,
-            max_center_displacement=max_center_displacement,
-            max_shape_rmse=max_shape_rmse,
+        self.processor = MediaPipePalmLocalProcessor()
+        self.last_raw_frame = None
+        self._input = MediaPipeCameraInput(
+            model_asset_path=model_asset_path, camera_index=camera_index,
+            width=width, height=height, fps=fps,
+            invalid_hand_as_missing=True,
         )
-
-        # 记录启动时间，用于生成相对时间戳
         self._start_time = time.time()
 
-        # --- 配置 MediaPipe HandLandmarker ---
-        base_options = mp.tasks.BaseOptions(model_asset_path=str(self.model_asset_path))
-        options = mp.tasks.vision.HandLandmarkerOptions(
-            base_options=base_options,
-            running_mode=mp.tasks.vision.RunningMode.VIDEO,  # 视频模式（逐帧处理）
-            num_hands=2,                                     # 最多检测双手
-            min_hand_detection_confidence=min_confidence,
-            min_hand_presence_confidence=min_confidence,
-            min_tracking_confidence=min_confidence,
-        )
-        self._landmarker = mp.tasks.vision.HandLandmarker.create_from_options(options)
-
-        # --- 初始化摄像头 ---
-        self._cap = cv2.VideoCapture(camera_index)
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self._cap.set(cv2.CAP_PROP_FPS, fps)
-
     def next_input(self) -> dict | None:
-        """
-        从摄像头读取下一帧，检测手部关键点，更新缓冲区，
-        如果缓冲区积累了足够帧数，则返回一个重定向输入载荷字典。
-
-        返回:
-            dict: 包含左右手窗口、时间戳、来源和元数据的载荷；
-                  如果读取帧失败或缓冲区未就绪，返回 None。
-        """
-        # 1. 读取一帧图像
-        success, frame = self._cap.read()
-        if not success:
-            return None
-
-        # 2. 转换为 RGB 颜色空间（MediaPipe 要求）
-        frame_rgb = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
-
-        # 3. 包装为 MediaPipe Image 对象
-        mp_image = self._mp.Image(
-            image_format=self._mp.ImageFormat.SRGB,
-            data=frame_rgb,
-        )
-
-        # 4. 调用 MediaPipe 手部检测（视频模式下需要提供时间戳毫秒值）
-        timestamp_ms = int(time.time() * 1000)
-        result = self._landmarker.detect_for_video(mp_image, timestamp_ms)
-
-        # 5. 解析检测结果，提取左右手的关键点（21 个 x,y,z 坐标）
-        detections = []
-        if result.hand_landmarks:
-            for index, hand_landmarks in enumerate(result.hand_landmarks):
-                # 获取该手是左手还是右手
-                hand_type = result.handedness[index][0].category_name.lower()
-                # 提取关键点坐标（归一化的 x, y, z）
-                keypoints = np.asarray(
-                    [[landmark.x, landmark.y, landmark.z] for landmark in hand_landmarks],
-                    dtype=np.float32,
-                )
-                if hand_type in ("left", "right"):
-                    detections.append((hand_type, keypoints))
-
-        # 6. Shared hand core performs identity continuity, canonicalization,
-        # wrist-relative normalization, and three-frame windowing.
-        return self._hand_core.update_detections(
-            detections=detections,
-            timestamp=round(time.time() - self._start_time, 3),  # 相对时间（秒）
-            source=MEDIAPIPE_APPROX_SOURCE,                     # 标识数据来源
-            metadata={"camera_index": int(self._cap.get(self._cv2.CAP_PROP_POS_FRAMES))},  # 帧索引
-        )
+        try:
+            raw_frame = self._input.next_frame()
+            self.last_raw_frame = raw_frame
+            frame = {
+                **raw_frame,
+                "timestamp": round(time.time() - self._start_time, 3),
+                "metadata": {
+                    **raw_frame.get("metadata", {}),
+                    "raw_timestamp_ms": raw_frame["timestamp"],
+                    "timestamp_unit": "relative_seconds",
+                },
+            }
+            return self.processor.process_frame(frame)
+        except BaseException:
+            self.last_raw_frame = None
+            self.release()
+            raise
 
     def release(self) -> None:
-        """
-        释放摄像头资源和 MediaPipe landmarker 资源。
-        应在适配器不再使用时调用。
-        """
-        if self._cap is not None:
-            self._cap.release()
-        if self._landmarker is not None:
-            self._landmarker.close()
+        self.processor.reset()
+        self._input.release()
 
-    # --- 上下文管理器支持（with 语句） ---
     def __enter__(self) -> "MediaPipeCameraAdapter":
-        """进入上下文时返回自身实例。"""
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        """退出上下文时自动释放资源。"""
         self.release()
+
+
+def load_palm_local_retargeter(checkpoint_path=PALM_LOCAL_V2_CHECKPOINT, device="cpu"):
+    """Load the existing model and enforce the palm-local checkpoint contract."""
+    from retargeting.config import L21
+    from retargeting.model import create_twohand_retargeter
+
+    return create_twohand_retargeter(
+        L21.model_kwargs(), device, checkpoint_path=str(checkpoint_path),
+        expected_coordinate_alignment=PALM_LOCAL_COORDINATE_ALIGNMENT,
+    ).eval()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-asset-path", default="hand_landmarker.task")
+    parser.add_argument("--checkpoint", default=str(PALM_LOCAL_V2_CHECKPOINT))
+    parser.add_argument("--camera-index", type=int, default=0)
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--frames", type=int, default=300)
+    args = parser.parse_args()
+    if args.frames < 1:
+        parser.error("--frames must be positive")
+
+    counts = {side: {"raw": 0, "outputs": 0, "resets": 0, "recoveries": 0} for side in SIDES}
+    seen_output = {side: False for side in SIDES}
+    awaiting_recovery = {side: False for side in SIDES}
+    completed = 0
+    started = None
+    try:
+        import torch
+
+        if args.device == "cpu":
+            torch.set_num_threads(1)
+        model = load_palm_local_retargeter(args.checkpoint, args.device)
+        print(f"checkpoint={args.checkpoint} alignment={PALM_LOCAL_COORDINATE_ALIGNMENT} identity_tracking=False", flush=True)
+        print("Move hands into view, out of view, then back into view to check reset/recovery.", flush=True)
+        with MediaPipeCameraAdapter(args.model_asset_path, args.camera_index) as camera:
+            started = time.perf_counter()
+            for _ in range(args.frames):
+                previous_streak = dict(camera.processor.valid_streak)
+                payload = camera.next_input()
+                predictions = {side: None for side in SIDES} if payload is None else model.predict(payload, args.device)["hands"]
+                completed += 1
+                descriptions = []
+                for side in SIDES:
+                    raw = camera.last_raw_frame[side]
+                    palm = camera.processor.current_hands[side]
+                    window = None if payload is None else payload["hands"][side]
+                    angles = predictions[side]
+                    streak = camera.processor.valid_streak[side]
+                    event = ""
+                    counts[side]["raw"] += int(raw is not None)
+                    if streak == 0 and previous_streak[side] > 0:
+                        counts[side]["resets"] += 1
+                        awaiting_recovery[side] = seen_output[side]
+                        event = " reset"
+                    if angles is not None:
+                        if angles.shape != (18,) or not np.isfinite(angles).all():
+                            raise ValueError(f"Invalid {side} model output")
+                        counts[side]["outputs"] += 1
+                        seen_output[side] = True
+                        if awaiting_recovery[side]:
+                            counts[side]["recoveries"] += 1
+                            awaiting_recovery[side] = False
+                            event = " recovery_after_3_valid_frames"
+                    arrays = (raw, palm, window, angles)
+                    shapes = [None if value is None else value.shape for value in arrays]
+                    finite = all(np.isfinite(value).all() for value in arrays if value is not None)
+                    descriptions.append(
+                        f"{side}: raw={shapes[0]} palm={shapes[1]} window={shapes[2]} "
+                        f"angles={shapes[3]} finite={bool(finite)} streak={streak} "
+                        f"invalid={camera.processor.invalid_reasons[side]!r}{event}"
+                    )
+                fps = completed / max(time.perf_counter() - started, 1e-9)
+                print(f"frame={completed} timestamp={camera.last_raw_frame['timestamp']} unix_ms "
+                      f"{' | '.join(descriptions)} FPS={fps:.1f}", flush=True)
+    except KeyboardInterrupt:
+        print("Capture stopped.")
+    except Exception as error:
+        print(f"Realtime smoke failed: {error}", flush=True)
+        return 1
+    elapsed = 0.0 if started is None else time.perf_counter() - started
+    print(f"Captured={completed} counts={counts} FPS={completed / max(elapsed, 1e-9):.1f}; resources released")
+    if not any(counts[side]["outputs"] for side in SIDES):
+        print("Hand windows and real-hand inference were not observed; manual verification is still required.")
+    elif not any(counts[side]["recoveries"] for side in SIDES):
+        print("Real-hand dropout/recovery was not observed; manual verification is still required.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
